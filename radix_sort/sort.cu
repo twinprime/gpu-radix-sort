@@ -1,14 +1,17 @@
 #include "sort.h"
+#include "utils.h"
 
 #define MAX_BLOCK_SZ 128
 
-__global__ void gpu_radix_sort_local(unsigned int* d_out_sorted,
+extern "C" __global__ void gpu_radix_sort_local(unsigned int* d_out_sorted,
     unsigned int* d_prefix_sums,
     unsigned int* d_block_sums,
     unsigned int input_shift_width,
     unsigned int* d_in,
     unsigned int d_in_len,
-    unsigned int max_elems_per_block)
+    unsigned int max_elems_per_block,
+    unsigned int* d_idx_in,
+    unsigned int* d_idx_out)
 {
     // need shared memory array for:
     // - block's share of the input data (local sort will be put here too)
@@ -150,16 +153,20 @@ __global__ void gpu_radix_sort_local(unsigned int* d_out_sorted,
         // Copy block-wise sort results to global 
         d_prefix_sums[cpy_idx] = s_merged_scan_mask_out[thid];
         d_out_sorted[cpy_idx] = s_data[thid];
+        if (d_idx_out != NULL)
+            d_idx_out[max_elems_per_block * blockIdx.x + new_pos] = d_idx_in[cpy_idx];
     }
 }
 
-__global__ void gpu_glbl_shuffle(unsigned int* d_out,
+extern "C" __global__ void gpu_glbl_shuffle(unsigned int* d_out,
     unsigned int* d_in,
     unsigned int* d_scan_block_sums,
     unsigned int* d_prefix_sums,
     unsigned int input_shift_width,
     unsigned int d_in_len,
-    unsigned int max_elems_per_block)
+    unsigned int max_elems_per_block,
+    unsigned int* d_idx_in,
+    unsigned int* d_idx_out)
 {
     // get d = digit
     // get n = blockIdx
@@ -179,13 +186,48 @@ __global__ void gpu_glbl_shuffle(unsigned int* d_out,
             + t_prefix_sum;
         __syncthreads();
         d_out[data_glbl_pos] = t_data;
+        if (d_idx_out != NULL) {
+            d_idx_out[data_glbl_pos] = d_idx_in[cpy_idx];
+        }
+    }
+}
+
+extern "C" __global__ void float_flip(unsigned int* d_out, float* d_in, unsigned int d_len)
+{
+    int index = blockIdx.x * blockDim.x + threadIdx.x;
+    int stride = blockDim.x * gridDim.x;
+    for (int i = index; i < d_len; i += stride) {
+        unsigned int d = reinterpret_cast<unsigned int&>(d_in[i]);
+        unsigned int mask = -(unsigned int)(d >> 31) | 0x80000000;
+	    d_out[i] = d ^ mask;
+    }
+}
+
+extern "C" __global__ void inverse_float_flip(float* d_out, unsigned int* d_in, unsigned int d_len)
+{
+    int index = blockIdx.x * blockDim.x + threadIdx.x;
+    int stride = blockDim.x * gridDim.x;
+    for (int i = index; i < d_len; i += stride) {
+        unsigned int mask = ((d_in[i] >> 31) - 1) | 0x80000000;
+        unsigned int f = d_in[i] ^ mask;
+        d_out[i] = reinterpret_cast<float&>(f);
+    }
+}
+
+extern "C" __global__ void init_idx(unsigned int* d_idx_out, unsigned int d_len)
+{
+    int index = blockIdx.x * blockDim.x + threadIdx.x;
+    int stride = blockDim.x * gridDim.x;
+    for (int i = index; i < d_len; i += stride) {
+        d_idx_out[i] = i;
     }
 }
 
 // An attempt at the gpu radix sort variant described in this paper:
 // https://vgc.poly.edu/~csilva/papers/cgf.pdf
-void radix_sort(unsigned int* const d_out,
-    unsigned int* const d_in,
+void radix_sort(float* const d_f_out,
+    unsigned int* const d_idx_out,
+    float* const d_f_in,
     unsigned int d_in_len)
 {
     unsigned int block_sz = MAX_BLOCK_SZ;
@@ -194,6 +236,16 @@ void radix_sort(unsigned int* const d_out,
     // Take advantage of the fact that integer division drops the decimals
     if (d_in_len % max_elems_per_block != 0)
         grid_sz += 1;
+
+    unsigned int* d_in = reinterpret_cast<unsigned int*>(d_f_in);
+    unsigned int* d_out = reinterpret_cast<unsigned int*>(d_f_out);
+    float_flip<<<grid_sz, block_sz>>>(d_in, d_f_in, d_in_len);
+
+    unsigned int* d_idx_in = NULL;
+    if (d_idx_out != NULL) {
+        checkCudaErrors(cudaMalloc(&d_idx_in, sizeof(unsigned int) * d_in_len));
+        init_idx<<<grid_sz, block_sz>>>(d_idx_in, d_in_len);
+    }
 
     unsigned int* d_prefix_sums;
     unsigned int d_prefix_sums_len = d_in_len;
@@ -223,18 +275,19 @@ void radix_sort(unsigned int* const d_out,
                             + s_scan_mask_out_sums_len)
                             * sizeof(unsigned int);
 
-
     // for every 2 bits from LSB to MSB:
     //  block-wise radix sort (write blocks back to global memory)
     for (unsigned int shift_width = 0; shift_width <= 30; shift_width += 2)
     {
-        gpu_radix_sort_local<<<grid_sz, block_sz, shmem_sz>>>(d_out, 
+        gpu_radix_sort_local<<<grid_sz, block_sz, shmem_sz>>>(d_out,
                                                                 d_prefix_sums, 
                                                                 d_block_sums, 
                                                                 shift_width, 
                                                                 d_in, 
                                                                 d_in_len, 
-                                                                max_elems_per_block);
+                                                                max_elems_per_block,
+                                                                d_idx_in,
+                                                                d_idx_out);
 
         //unsigned int* h_test = new unsigned int[d_in_len];
         //checkCudaErrors(cudaMemcpy(h_test, d_in, sizeof(unsigned int) * d_in_len, cudaMemcpyDeviceToHost));
@@ -247,15 +300,21 @@ void radix_sort(unsigned int* const d_out,
         sum_scan_blelloch(d_scan_block_sums, d_block_sums, d_block_sums_len);
 
         // scatter/shuffle block-wise sorted array to final positions
-        gpu_glbl_shuffle<<<grid_sz, block_sz>>>(d_in, 
-                                                    d_out, 
+        gpu_glbl_shuffle<<<grid_sz, block_sz>>>(d_in,
+                                                    d_out,
                                                     d_scan_block_sums, 
                                                     d_prefix_sums, 
                                                     shift_width, 
                                                     d_in_len, 
-                                                    max_elems_per_block);
+                                                    max_elems_per_block,
+                                                    d_idx_out,
+                                                    d_idx_in);
     }
+
     checkCudaErrors(cudaMemcpy(d_out, d_in, sizeof(unsigned int) * d_in_len, cudaMemcpyDeviceToDevice));
+    inverse_float_flip<<<grid_sz, block_sz>>>(d_f_out, d_out, d_in_len);
+    if (d_idx_out != NULL)
+        checkCudaErrors(cudaMemcpy(d_idx_out, d_idx_in, sizeof(unsigned int) * d_in_len, cudaMemcpyDeviceToDevice));
 
     checkCudaErrors(cudaFree(d_scan_block_sums));
     checkCudaErrors(cudaFree(d_block_sums));

@@ -98,4 +98,15 @@ void checkResultsAutodesk(const T* const ref, const T* const gpu, size_t numElem
   }
 }
 
+template<typename T>
+void printDeviceArray(const T* const d, unsigned int len, unsigned int elem_size) {
+  T* h = new T[len];
+  cudaMemcpy(h, d, len * elem_size, cudaMemcpyDeviceToHost);
+  for (unsigned int i = 0; i < len; i++) {
+    std::cout << h[i] << " ";
+  }
+  std::cout << std::endl;
+  delete[] h;
+}
+
 #endif

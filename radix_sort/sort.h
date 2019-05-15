@@ -6,8 +6,9 @@
 #include "scan.h"
 #include <cmath>
 
-void radix_sort(unsigned int* const d_out,
-    unsigned int* const d_in,
+void radix_sort(float* const d_out,
+    unsigned int* const d_idx_out,
+    float* const d_in,
     unsigned int d_in_len);
 
 #endif

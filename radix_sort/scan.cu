@@ -13,7 +13,7 @@
 #define CONFLICT_FREE_OFFSET(n) ((n) >> LOG_NUM_BANKS)
 #endif
 
-__global__
+extern "C" __global__
 void gpu_add_block_sums(unsigned int* const d_out,
     const unsigned int* const d_in,
     unsigned int* const d_block_sums,
@@ -59,7 +59,7 @@ void gpu_add_block_sums(unsigned int* const d_out,
 
 // Modified version of Mark Harris' implementation of the Blelloch scan
 //  according to https://www.mimuw.edu.pl/~ps209291/kgkp/slides/scan.pdf
-__global__
+extern "C" __global__
 void gpu_prescan(unsigned int* const d_out,
     const unsigned int* const d_in,
     unsigned int* const d_block_sums,

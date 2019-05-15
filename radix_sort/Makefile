@@ -1,4 +1,4 @@
-CUDA_PATH ?= "/usr/local/cuda-7.5"
+CUDA_PATH ?= "/usr/local/cuda-10.1"
 NVCC := $(CUDA_PATH)/bin/nvcc
 NVCC_OPTS=-O3 -arch=sm_37 -Xcompiler -Wall -Xcompiler -Wextra -m64
 
